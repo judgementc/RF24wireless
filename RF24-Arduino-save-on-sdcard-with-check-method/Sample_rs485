@@ -1,0 +1,197 @@
+
+/*
+The returned datapacket from the weather station:
+Index    Data
+0        data length      # of data bytes not including checksum
+1        node #
+4        wind direction
+5        wind speed
+6, 7     temperature
+12       power supply
+13       light intensity
+14       speed cal
+16       check sum
+*/
+
+>
+#include <PString.h>
+#include <SoftwareSerial.h>
+#include <LiquidCrystal.h>
+LiquidCrystal lcd(8, 9, 4, 5, 6, 7);
+
+
+uint8_t dataPacket[20];
+uint8_t testDataPacket[20] = {
+  0x0f, 0x00, 0x00, 0x00, 0x0a, 0x01, 0x00, 0x53, 0x00, 0x00, 0x00, 0x00, 0x57, 0x76, 0x64, 0x00, 0x92};
+uint8_t head[3] = {
+  0x2B, 0x77, 0x73}; // "+ws"
+uint8_t dataCommand[10] = {
+  0x07, 0x00, 0xEB, 0xA1, 0x00, 0x00, 0x00, 0x00};
+uint8_t nn; // node number
+uint8_t cs; // checksum
+uint8_t nodeSetCommand[] = { 
+  0x04, 0x00, 0xEB, 0xB3, nn, cs };   // calculate checksum for new node number
+uint8_t br; // baud rate 1(2400bps),2(4800bps),3(9600bps),4(19200bps)
+uint8_t baudSetCommand[] = {
+  0x06, 0x00, 0xEB, 0xB4, br, 0x00, 0x00, cs };
+uint8_t dc; //  direction cal 1 - 16, hold vane steady and set dc to number (1-16) corresponding to direction it is pointing
+uint8_t dirSetCommand[] = {
+  0x04, 0x00, 0xEB, 0xA4, dc, cs };
+
+char* windDirection[16] = {
+  "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"}; // index +1 is used for direction cal
+
+bool flag;
+//uint8_t *pPointer;
+char buffer[20]; // buffer for LCD display line for PString
+
+
+//**********************************************************
+// declarations for software serial for RS485 link. Node address is default 0x00 but can be changed by command. Reply strings from
+// weather station have node address 0x01. No explanation.
+
+
+const uint8_t DD = 10; // data direction pin 10, xmit = HIGH, recv = LOW
+const uint8_t RXpin = 2;
+const uint8_t TXpin = 3;
+SoftwareSerial RS485(RXpin, TXpin);
+uint8_t xmit = HIGH;
+uint8_t recv = LOW;
+
+
+
+//*****************************************************************
+// send "+ws" + variable length command string to weather station. Command strings hard coded constants above.
+
+void sendCommand(uint8_t* command){
+  digitalWrite(DD, xmit); //set RS485 to transmit
+  uint8_t checksum = 0;
+  RS485.write(0x2b);
+  RS485.write(0x77);
+  RS485.write(0x73);// send header
+
+  RS485.write(*command); // send length
+  for (uint8_t i=*command++; i>0; i--){ // for length
+    checksum += *command;
+    RS485.write(*command++); // send command bytes
+  }
+  RS485.write(checksum);  // send checksum
+  digitalWrite(DD, recv); //set RS485 to receive
+}
+
+
+//***********************************************************
+// read variable length packet with "+ws" header followed by length byte + "length" bytes + checksum byte. Stored in *packet.
+// returns boolean according to success. False if header not found or receive buffer empty too soon.
+
+boolean readPacket(uint8_t* packet){ // fill array *packet from RS485
+  digitalWrite(DD, recv); //set RS485 to receive
+  int flag = 1;
+  while (RS485.available()) { // search for first "+"
+    if (RS485.read() == 0x2b) {
+      flag = 0;
+      break;        
+    }
+  }
+  if (flag) return false; // exhausted receive buffer without finding "+"
+
+  if (RS485.available())  // then look for "w"
+    if (RS485.read() == 0x77)
+      ;  
+    else return false;
+  else return false;
+
+  if (RS485.available())  // then look for "s"
+    if (RS485.read() == 0x73)
+      ;
+    else return false;
+  else return false;
+
+  if (RS485.available()) 
+    *packet =  RS485.read(); // store length byte in packet[0]
+  else return false;
+
+  for (byte i = *packet++; i > 0; i--){
+    if (RS485.available())
+      *packet++ = RS485.read();
+    else return false;
+  }
+  if (RS485.available()){ // read check sum
+    *packet = RS485.read();
+    return true;
+  }
+  else return false;
+}
+
+//**************************************************************
+// Station has DS18S20 1-wire temp chip. 9-bit resolution, 0.5 C per lsb
+
+float stationTemperature(uint8_t* packet){
+  int Cdegrees = (*(packet + 6) << 8) + *(packet + 7) ; // signed integer Temperature in packet[6] and packet[7]
+  return Cdegrees / 2.0 * 9.0 / 5.0 + 32.0;  
+}
+
+
+void setup() {
+  
+  delay(250); // for EtherTen reset issue
+  pinMode(RXpin, INPUT);
+  pinMode(TXpin, OUTPUT);
+  pinMode(DD,OUTPUT); // Create a pin to control the RS485 data direction
+  digitalWrite(DD, recv); // Set RS485 transceiver to recieve
+  Serial.begin(9600);
+  RS485.begin(9600); // Create an instance of SoftwareSerial named "RS485"
+  PString str(buffer, sizeof(buffer)); // string to hold LCD line
+  lcd.begin(16,2); // 16x2 LCD display
+
+  str.begin();
+  lcd.setCursor(0,0); // LCD cursor to col 1 row 1
+  str.print("WS Temp "); // internal weather station temperature
+  str.print(stationTemperature(testDataPacket), 1);
+  str.print(223,BYTE); // 223 is the degree symbol           
+  str.print("F");
+  lcd.print(str);
+
+  str.begin();
+  lcd.setCursor(0,1); // LCD cursor to col 1 row 2
+  str.print("Wind ");
+  str.print(windDirection[testDataPacket[4]-1]);
+  str.print(" ");
+  float windSpeed = testDataPacket[5] * 2.453; // mph
+  if (windSpeed < 10) str.print(windSpeed,1);
+  else str.print(windSpeed,0);
+  str.print(" mph");
+  lcd.print(str);
+
+}
+
+
+
+void loop() {
+  /*  sendCommand(dataCommand);
+   delay(100); // necessary at 9600 baud!
+   
+   
+   if (readPacket(dataPacket)){ // read data into dataPacket
+   Serial.print(stationTemperature(dataPacket), 2);
+   Serial.println(" Degrees F");
+   
+   Serial.print("Wind direction is ");
+   Serial.print(windDirection[dataPacket[4]-1]);
+   Serial.print(" at ");
+   float windSpeed = dataPacket[5] * 2.453; // mph
+   Serial.print(windSpeed,2);
+   Serial.println(" mph");
+   
+   Serial.print("Power Supply is ");
+   Serial.print(dataPacket[12] / 255.0 * 5.0 * 4.33, 2);
+   Serial.println(" Volts DC");
+   
+   Serial.print("Light Intensity is ");
+   Serial.print(dataPacket[13] / 255.0 * 100, 2);
+   Serial.println("%");
+   }
+   else Serial.println(" Major Failure!");
+   delay(2000);
+   */
+}
